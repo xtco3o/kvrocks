@@ -101,8 +101,16 @@ Server::Server(engine::Storage *storage, Config *config)
   // init shard pub/sub channels
   pubsub_shard_channels_.resize(config->cluster_enabled ? HASH_SLOTS_SIZE : 1);
 
+  std::vector<int> listen_fds;
   for (int i = 0; i < config->workers; i++) {
-    auto worker = std::make_unique<Worker>(this, config);
+#ifdef __APPLE__
+    auto worker = std::make_unique<Worker>(this, config, listen_fds);
+    if (i == 0) {
+      listen_fds = worker->GetTCPListenFDs();
+    }
+#else
+    auto worker = std::make_unique<Worker>(this, config, std::vector<int>{});
+#endif
     // multiple workers can't listen to the same unix socket, so
     // listen unix socket only from a single worker - the first one
     if (!config->unixsocket.empty() && i == 0) {
@@ -254,6 +262,13 @@ void Server::Stop() {
   slaveof_mu_.lock();
   if (replication_thread_) replication_thread_->Stop();
   slaveof_mu_.unlock();
+
+  {
+    std::lock_guard<std::mutex> guard(running_scripts_mu_);
+    for (auto *rctx : running_scripts_) {
+      rctx->is_killed = true;
+    }
+  }
 
   for (const auto &worker : worker_threads_) {
     worker->Stop(0 /* immediately terminate  */);
@@ -1879,6 +1894,61 @@ StatusOr<std::unique_ptr<redis::Commander>> Server::LookupAndCreateCommand(const
   return std::move(cmd);
 }
 
+void Server::RegisterRunningScript(lua::ScriptRunCtx *rctx) {
+  std::lock_guard<std::mutex> guard(running_scripts_mu_);
+  running_scripts_.push_back(rctx);
+  running_script_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Server::UnregisterRunningScript(lua::ScriptRunCtx *rctx) {
+  std::lock_guard<std::mutex> guard(running_scripts_mu_);
+  auto it = std::find(running_scripts_.begin(), running_scripts_.end(), rctx);
+  if (it != running_scripts_.end()) {
+    running_scripts_.erase(it);
+    running_script_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+
+bool Server::IsScriptTimedOut() const {
+  int limit = config_->lua_time_limit;
+  if (limit <= 0) return false;
+  if (running_script_count_.load(std::memory_order_relaxed) == 0) return false;
+
+  uint64_t now_ms = util::GetTimeStampMS();
+  std::lock_guard<std::mutex> guard(running_scripts_mu_);
+  for (const auto *rctx : running_scripts_) {
+    if (now_ms - rctx->start_time_ms >= static_cast<uint64_t>(limit)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Status Server::ScriptKill() {
+  std::lock_guard<std::mutex> guard(running_scripts_mu_);
+  if (running_scripts_.empty()) {
+    return {Status::NotOK, "NOTBUSY No scripts in execution right now."};
+  }
+
+  bool has_unkillable = false;
+  for (auto *rctx : running_scripts_) {
+    if (rctx->is_write_dirty) {
+      has_unkillable = true;
+    } else {
+      rctx->is_killed = true;
+    }
+  }
+
+  if (has_unkillable) {
+    return {Status::NotOK,
+            "UNKILLABLE Sorry the script already executed write commands against the dataset. "
+            "You can either wait the script termination or kill the server in a hard way using the SHUTDOWN NOSAVE "
+            "command."};
+  }
+
+  return Status::OK();
+}
+
 Status Server::ScriptExists(const std::string &sha) const {
   std::string body;
   return ScriptGet(sha, &body);
@@ -2068,8 +2138,14 @@ void Server::AdjustWorkerThreads() {
 }
 
 void Server::increaseWorkerThreads(size_t delta) {
+  std::vector<int> listen_fds;
+#ifdef __APPLE__
+  if (!worker_threads_.empty()) {
+    listen_fds = worker_threads_[0]->GetWorker()->GetTCPListenFDs();
+  }
+#endif
   for (size_t i = 0; i < delta; i++) {
-    auto worker = std::make_unique<Worker>(this, config_);
+    auto worker = std::make_unique<Worker>(this, config_, listen_fds);
     auto worker_thread = std::make_unique<WorkerThread>(std::move(worker));
     worker_thread->Start();
     worker_threads_.emplace_back(std::move(worker_thread));

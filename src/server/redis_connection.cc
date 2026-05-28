@@ -433,6 +433,18 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     to_process_cmds->pop_front();
     if (cmd_tokens.empty()) continue;
 
+    bool is_script_kill = (util::EqualICase(cmd_tokens.front(), "script") && cmd_tokens.size() >= 2 &&
+                           util::EqualICase(cmd_tokens[1], "kill"));
+    bool is_shutdown = util::EqualICase(cmd_tokens.front(), "shutdown");
+
+    if (srv_->IsScriptTimedOut()) {
+      if (!is_script_kill && !is_shutdown) {
+        Reply(redis::Error({Status::RedisErrorNoPrefix,
+                            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE."}));
+        continue;
+      }
+    }
+
     bool is_multi_exec = IsFlagEnabled(Connection::kMultiExec);
     if (IsFlagEnabled(redis::Connection::kCloseAfterReply) && !is_multi_exec) break;
     auto multi_error_exit = MakeScopeExit([&] {
@@ -457,7 +469,6 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       continue;
     }
     auto current_cmd = std::move(*cmd_s);
-
     const auto &attributes = current_cmd->GetAttributes();
     auto cmd_name = attributes->name;
 
@@ -494,7 +505,9 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     // that can guarantee other threads can't come into critical zone, such as DEBUG,
     // CLUSTER subcommand, CONFIG SET, MULTI, LUA (in the immediate future).
     // Otherwise, we just use 'ConcurrencyGuard' to allow all workers to execute commands at the same time.
-    if (is_multi_exec && !(cmd_flags & kCmdBypassMulti)) {
+    if (is_script_kill || is_shutdown) {
+      // Bypass locks to allow SCRIPT KILL and SHUTDOWN to run even if another thread is stuck in a script
+    } else if (is_multi_exec && !(cmd_flags & kCmdBypassMulti)) {
       // No lock guard, because 'exec' command has acquired 'WorkExclusivityGuard'
     } else if (cmd_flags & kCmdExclusive) {
       exclusivity = srv_->WorkExclusivityGuard();

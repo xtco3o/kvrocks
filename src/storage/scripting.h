@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,7 @@ int RedisErrorReplyCommand(lua_State *lua);
 int RedisLogCommand(lua_State *lua);
 int RedisRegisterFunction(lua_State *lua);
 int RedisSetResp(lua_State *lua);
+void LuaMaskCountHook(lua_State *lua, lua_Debug *ar);
 
 Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lua_State *lua, bool need_to_store);
 
@@ -157,6 +159,11 @@ struct ScriptRunCtx {
   redis::Connection *conn = nullptr;
   // the storage context
   engine::Context *ctx = nullptr;
+
+  uint64_t start_time_ms = 0;
+  std::atomic<bool> is_killed{false};
+  bool slow_logged = false;
+  std::atomic<bool> is_write_dirty{false};
 };
 
 /// SaveOnRegistry saves user-defined data to lua REGISTRY
